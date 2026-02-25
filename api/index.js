@@ -2,6 +2,8 @@
 import https from 'https';
 import http from 'http';
 
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -23,6 +25,8 @@ export default async function handler(req, res) {
     port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
     path: targetUrl.pathname + targetUrl.search,
     method: 'GET',
+    rejectUnauthorized: false,
+    agent: targetUrl.protocol === 'https:' ? httpsAgent : undefined,
     headers: {
       'Referer': 'https://hianimez.to/',
       'Origin': 'https://hianimez.to',
