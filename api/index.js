@@ -4,6 +4,14 @@ import http from 'http';
 
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
+const REFERERS = [
+  'https://megacloud.blog/',
+  'https://megacloud.tv/',
+  'https://hianimez.to/',
+  'https://hianime.to/',
+  'https://aniwatch.to/',
+];
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -18,6 +26,10 @@ export default async function handler(req, res) {
   try { targetUrl = new URL(target); }
   catch { return res.status(400).json({ error: 'Invalid URL' }); }
 
+  // Try each referer until one works
+  const refererIndex = parseInt(req.query.ri || '0');
+  const referer = REFERERS[refererIndex % REFERERS.length];
+
   const lib = targetUrl.protocol === 'https:' ? https : http;
 
   const options = {
@@ -28,15 +40,19 @@ export default async function handler(req, res) {
     rejectUnauthorized: false,
     agent: targetUrl.protocol === 'https:' ? httpsAgent : undefined,
     headers: {
-      'Referer': 'https://hianimez.to/',
-      'Origin': 'https://hianimez.to',
+      'Referer': referer,
+      'Origin': referer.replace(/\/$/, ''),
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'cross-site',
     },
   };
 
   return new Promise((resolve) => {
     const proxyReq = lib.request(options, (upstream) => {
-      // Follow redirects
       if ([301,302,303,307,308].includes(upstream.statusCode) && upstream.headers.location) {
         const newUrl = new URL(upstream.headers.location, target);
         req.query.url = newUrl.toString();
@@ -49,23 +65,11 @@ export default async function handler(req, res) {
 
       const chunks = [];
       upstream.on('data', chunk => chunks.push(chunk));
-      upstream.on('end', () => {
-        res.send(Buffer.concat(chunks));
-        resolve();
-      });
+      upstream.on('end', () => { res.send(Buffer.concat(chunks)); resolve(); });
     });
 
-    proxyReq.on('error', (e) => {
-      res.status(502).json({ error: 'Upstream fetch failed', detail: e.message });
-      resolve();
-    });
-
-    proxyReq.setTimeout(15000, () => {
-      proxyReq.destroy();
-      res.status(504).json({ error: 'Upstream timeout' });
-      resolve();
-    });
-
+    proxyReq.on('error', (e) => { res.status(502).json({ error: 'Upstream fetch failed', detail: e.message }); resolve(); });
+    proxyReq.setTimeout(15000, () => { proxyReq.destroy(); res.status(504).json({ error: 'Upstream timeout' }); resolve(); });
     proxyReq.end();
   });
 }
