@@ -1,75 +1,79 @@
-// api/index.js
-import https from 'https';
-import http from 'http';
-
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
-
-const REFERERS = [
-  'https://megacloud.blog/',
-  'https://megacloud.tv/',
-  'https://hianimez.to/',
-  'https://hianime.to/',
-  'https://aniwatch.to/',
-];
+// index.js — the entire proxy server
+// Deploy this as a NEW standalone Vercel project (not inside aniwatch-api)
+//
+// FIX: Properly passes through JSON content-type for aniwatch API responses.
+// FIX: Added detailed error logging to diagnose 500s.
+// FIX: Removed allowlist restriction that was silently blocking aniwatch API domains.
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
 
-  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
 
-  const target = req.query.url;
-  if (!target) return res.status(400).json({ error: 'Missing ?url= parameter' });
+  const { url } = req.query;
+  if (!url) { res.status(400).json({ error: 'Missing url' }); return; }
 
   let targetUrl;
-  try { targetUrl = new URL(target); }
-  catch { return res.status(400).json({ error: 'Invalid URL' }); }
+  try {
+    targetUrl = decodeURIComponent(url);
+    // Validate it's a real URL
+    new URL(targetUrl);
+  } catch (e) {
+    res.status(400).json({ error: 'Invalid url: ' + e.message });
+    return;
+  }
 
-  // Try each referer until one works
-  const refererIndex = parseInt(req.query.ri || '0');
-  const referer = REFERERS[refererIndex % REFERERS.length];
+  // Block SSRF — disallow internal/metadata addresses
+  const hostname = new URL(targetUrl).hostname;
+  const BLOCKED = ['localhost', '127.0.0.1', '0.0.0.0', '169.254.169.254', 'metadata.google.internal'];
+  if (BLOCKED.some(h => hostname === h || hostname.endsWith('.' + h))) {
+    res.status(403).json({ error: 'Blocked host: ' + hostname });
+    return;
+  }
 
-  const lib = targetUrl.protocol === 'https:' ? https : http;
-
-  const options = {
-    hostname: targetUrl.hostname,
-    port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
-    path: targetUrl.pathname + targetUrl.search,
-    method: 'GET',
-    rejectUnauthorized: false,
-    agent: targetUrl.protocol === 'https:' ? httpsAgent : undefined,
-    headers: {
-      'Referer': referer,
-      'Origin': referer.replace(/\/$/, ''),
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors',
-      'sec-fetch-site': 'cross-site',
-    },
-  };
-
-  return new Promise((resolve) => {
-    const proxyReq = lib.request(options, (upstream) => {
-      if ([301,302,303,307,308].includes(upstream.statusCode) && upstream.headers.location) {
-        const newUrl = new URL(upstream.headers.location, target);
-        req.query.url = newUrl.toString();
-        resolve(handler(req, res));
-        return;
-      }
-
-      res.setHeader('Content-Type', upstream.headers['content-type'] || 'application/octet-stream');
-      res.status(upstream.statusCode);
-
-      const chunks = [];
-      upstream.on('data', chunk => chunks.push(chunk));
-      upstream.on('end', () => { res.send(Buffer.concat(chunks)); resolve(); });
+  try {
+    const upstream = await fetch(targetUrl, {
+      headers: {
+        'Referer':    'https://hianime.to/',
+        'Origin':     'https://hianime.to',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept':     '*/*',
+        // Pass through range header for video segments
+        ...(req.headers['range'] ? { 'Range': req.headers['range'] } : {}),
+      },
+      redirect: 'follow',
     });
 
-    proxyReq.on('error', (e) => { res.status(502).json({ error: 'Upstream fetch failed', detail: e.message }); resolve(); });
-    proxyReq.setTimeout(15000, () => { proxyReq.destroy(); res.status(504).json({ error: 'Upstream timeout' }); resolve(); });
-    proxyReq.end();
-  });
+    if (!upstream.ok) {
+      // Log the upstream error body so it shows in Vercel function logs
+      let errBody = '';
+      try { errBody = await upstream.text(); } catch (_) {}
+      console.error('[proxy] upstream error', upstream.status, targetUrl.slice(0, 200), errBody.slice(0, 500));
+      res.status(upstream.status).json({
+        error: `Upstream ${upstream.status}`,
+        url: targetUrl.slice(0, 200),
+        body: errBody.slice(0, 300),
+      });
+      return;
+    }
+
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+
+    // Pass through relevant upstream headers
+    ['content-length', 'content-range', 'accept-ranges'].forEach(h => {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
+    });
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=30');
+
+    const buffer = await upstream.arrayBuffer();
+    res.status(upstream.status || 200).send(Buffer.from(buffer));
+  } catch (e) {
+    console.error('[proxy] fetch threw:', e.message, targetUrl.slice(0, 200));
+    res.status(502).json({ error: e.message, url: targetUrl.slice(0, 200) });
+  }
 }
